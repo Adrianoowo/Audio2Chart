@@ -51,8 +51,8 @@ def convert_sng_to_chart(dataset_path: str):
             fail_count += 1
 
     print("\n--- Conversion Summary ---")
-    print(f"Successfully converted: {success_count}/{len(sng_files)}")
-    print(f"Failed: {fail_count}/{len(sng_files)}")
+    print(f"Successfully converted: {success_count}/{len(target_files)}")
+    print(f"Failed: {fail_count}/{len(target_files)}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Batch convert .sng files to .chart using Onyx.")
