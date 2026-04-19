@@ -5,6 +5,7 @@ from model import ChartNet
 from Dataloader import Dataset
 from tqdm import tqdm
 import argparse
+import os
 
 def train_model(data_path="data.pkl", epochs=30, batch_size=4, lr=0.001):
     # Dataloader hasn't explicitly changed structurally regarding keys: input/label
@@ -29,8 +30,19 @@ def train_model(data_path="data.pkl", epochs=30, batch_size=4, lr=0.001):
     
     optim = torch.optim.Adam(model.parameters(), lr=lr)
 
+    os.makedirs("checkpoints", exist_ok=True)
+    start_epoch = 0
+    checkpoint_path = "checkpoints/autosave.pth"
+    if os.path.exists(checkpoint_path):
+        print(f"Resuming training from checkpoint: {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optim.load_state_dict(checkpoint['optimizer_state_dict'])
+        start_epoch = checkpoint['epoch'] + 1
+        print(f"Resuming at epoch {start_epoch + 1}")
+
     print("Beginning Training Loop...")
-    for epoch in range(epochs):
+    for epoch in range(start_epoch, epochs):
         model.train()
         running_loss = 0.0
         
@@ -52,6 +64,13 @@ def train_model(data_path="data.pkl", epochs=30, batch_size=4, lr=0.001):
         
         # Save checkpoints aggressively
         torch.save(model.state_dict(), f"checkpoints/drum_model_epoch_{epoch+1}.pth")
+        
+        # Save autosave checkpoint
+        torch.save({
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optim.state_dict(),
+        }, checkpoint_path)
 
     print("Training finished perfectly!")
 
