@@ -23,7 +23,30 @@ class Dataset(torch.utils.data.Dataset):
 
     def __getitem__(self, index):
         # Dynamically grabs and drops tensor arrays instantly mapping memory conservatively
-        return torch.load(self.files[index], weights_only=True)
+        payload = torch.load(self.files[index], weights_only=True)
+        
+        # Backward compatibility check for un-deleted old chunks
+        if "mel" not in payload:
+            return payload
+            
+        chunk_mel = payload["mel"]
+        labels = payload["labels"]
+        centers = payload["centers"]
+        
+        seq_len = labels.shape[0]
+        mel_context = 87
+        half_context = mel_context // 2
+        
+        seq_mels = []
+        for i in range(seq_len):
+            center = centers[i].item()
+            slice_mel = chunk_mel[:, center - half_context : center + (mel_context - half_context)]
+            seq_mels.append(slice_mel.unsqueeze(0))
+            
+        return {
+            "input": torch.stack(seq_mels), # [seq_len, 1, 128, 87]
+            "label": labels
+        }
 
     def __len__(self):
         return len(self.files)

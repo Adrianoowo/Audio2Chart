@@ -104,32 +104,40 @@ def process_dataset(dataset_path: str, output_pkl: str = "data.pkl"):
             seq_len = 200
             
             for seq_start in range(0, num_timesteps - seq_len, seq_len):
-                seq_mels = []
-                seq_labels = []
+                seq_labels = label_matrix[seq_start:seq_start+seq_len]
                 
+                # Determine absolute mel frame bounds for this entire sequence
+                first_s = (seq_start * parser.ms_per_frame) / 1000.0
+                first_center = int(librosa.time_to_frames(times=first_s, sr=sr, hop_length=mel_hop_length))
+                start_f = first_center - half_context
+                
+                last_s = ((seq_start + seq_len - 1) * parser.ms_per_frame) / 1000.0
+                last_center = int(librosa.time_to_frames(times=last_s, sr=sr, hop_length=mel_hop_length))
+                end_f = last_center + (mel_context_frames - half_context)
+                
+                # Padding zero handlers mapped via chunk bounds
+                pad_left = max(0, -start_f)
+                pad_right = max(0, end_f - mel_spectrogram.shape[1])
+                
+                slice_start = max(0, start_f)
+                slice_end = min(mel_spectrogram.shape[1], end_f)
+                
+                chunk_mel = mel_spectrogram[:, slice_start:slice_end]
+                if pad_left > 0 or pad_right > 0:
+                    chunk_mel = torch.nn.functional.pad(chunk_mel, (pad_left, pad_right))
+                
+                centers = []
                 for t in range(seq_start, seq_start + seq_len):
-                    # time in seconds
                     current_s = (t * parser.ms_per_frame) / 1000.0
-                    center_mel_frame = librosa.time_to_frames(times=current_s, sr=sr, hop_length=mel_hop_length)
-                    
-                    start_f = center_mel_frame - half_context
-                    end_f = center_mel_frame + (mel_context_frames - half_context)
-                    
-                    # Padding zero handlers
-                    if start_f < 0:
-                        slice_mel = torch.cat((torch.zeros([128, -start_f]), mel_spectrogram[:, :end_f]), dim=1)
-                    elif end_f > mel_spectrogram.shape[1]:
-                        slice_mel = torch.cat((mel_spectrogram[:, start_f:], torch.zeros([128, end_f - mel_spectrogram.shape[1]])), dim=1)
-                    else:
-                        slice_mel = mel_spectrogram[:, start_f:end_f]
-                        
-                    seq_mels.append(slice_mel.unsqueeze(0)) # Shape [1, 128, 87]
-                    seq_labels.append(torch.tensor(label_matrix[t]))
+                    center_mel = int(librosa.time_to_frames(times=current_s, sr=sr, hop_length=mel_hop_length))
+                    # Record the frame center localized to this chunk
+                    centers.append(center_mel - start_f)
                     
                 # Serialize the sequence dynamically to Disk avoiding dictionary bloat
                 tensor_payload = {
-                    "input": torch.stack(seq_mels), # [seq_len, 1, 128, 87]
-                    "label": torch.stack(seq_labels) # [seq_len, 5]
+                    "mel": chunk_mel.clone(), # Shape roughly [128, ~400] rather than [200, 128, 87]
+                    "labels": torch.tensor(seq_labels, dtype=torch.float32), # [seq_len, 5]
+                    "centers": torch.tensor(centers) # [seq_len]
                 }
                 torch.save(tensor_payload, tensors_dir / f"seq_{idx}_{seq_start}.pt")
                 chunk_count += 1
