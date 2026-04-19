@@ -6,19 +6,24 @@ this file is used to:
 
 for example: to get a sample from data.json, we can use `data[index]["input"]` and `data[index]["label"]`
 """
+import torch
 import torch.utils.data
-import pickle
-
+from pathlib import Path
+import tempfile
 
 class Dataset(torch.utils.data.Dataset):
-    def __init__(self, path):
+    def __init__(self, path="dataset_tensors"):
+        """ Lazily loads compiled chunks targeting the OS Temporary directory natively """
         super(Dataset, self).__init__()
-        with open(path, "rb") as f:
-            data = pickle.load(f)
-        self.data = data
+        
+        target_path = Path(tempfile.gettempdir()) / "audio2chart_tensors"
+        self.files = list(target_path.glob("*.pt"))
+        if not self.files:
+            print(f"Warning: No compiled training chunks discovered inside {target_path}!")
 
     def __getitem__(self, index):
-        return self.data[list(self.data.keys())[index]]
+        # Dynamically grabs and drops tensor arrays instantly mapping memory conservatively
+        return torch.load(self.files[index], weights_only=True)
 
     def __len__(self):
-        return len(self.data.keys())
+        return len(self.files)

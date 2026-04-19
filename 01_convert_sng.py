@@ -9,17 +9,18 @@ def convert_sng_to_chart(dataset_path: str):
         print(f"Error: Dataset path '{dataset_path}' does not exist.")
         return
 
-    sng_files = list(base_path.rglob("*.sng"))
-    if not sng_files:
-        print(f"No .sng files found in {dataset_path}.")
+    # Scan for both .sng strings and .mid (MIDI) binaries which compose the majority of RB datasets
+    target_files = list(base_path.rglob("*.sng")) + list(base_path.rglob("*.mid"))
+    if not target_files:
+        print(f"No .sng or .mid files found in {dataset_path}.")
         return
 
-    print(f"Found {len(sng_files)} .sng files. Starting conversion...")
+    print(f"Found {len(target_files)} unconverted charts. Starting Onyx conversion...")
 
     success_count = 0
     fail_count = 0
 
-    for sng_file in sng_files:
+    for sng_file in target_files:
         # Assuming onyx works like: onyx convert "input.sng"
         # We don't have the exact CLI documentation from the user, but this is typical.
         try:

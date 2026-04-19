@@ -3,6 +3,7 @@ import librosa.feature
 import torch
 import pickle
 import numpy as np
+import tempfile
 from pathlib import Path
 from chart_parser import ChartParser
 import argparse
@@ -29,14 +30,35 @@ def process_dataset(dataset_path: str, output_pkl: str = "data.pkl"):
 
     data_store = {}
     
-    # Recursively find all folders holding a .chart file across nested subdirectories
-    song_folders = list(set([f.parent for f in base_path.rglob("*.chart")]))
+    # Recursively find all folders holding a .chart or .mid file across nested subdirectories
+    chart_folders = [f.parent for f in base_path.rglob("*.chart")]
+    mid_folders = [f.parent for f in base_path.rglob("*.mid")]
+    song_folders = list(set(chart_folders + mid_folders))
+    
     print(f"Discovered {len(song_folders)} folders recursively. Compiling training data...")
     
     valid_count = 0
+    chunk_count = 0
+    
+    # Establish disk-streaming bounds strictly onto the volatile Windows Temp drive
+    tensors_dir = Path(tempfile.gettempdir()) / "audio2chart_tensors"
+    tensors_dir.mkdir(parents=True, exist_ok=True)
+    
     for idx, folder in enumerate(song_folders):
         try:
-            chart_file = next(folder.glob("*.chart"), None)
+            chart_file = None
+            is_midi = False
+            
+            # Look for natively mapped Phase 2 targets OR Phase 1 midis natively
+            found_chart = list(folder.glob("*.chart"))
+            if found_chart:
+                chart_file = found_chart[0]
+            else:
+                found_mid = list(folder.glob("*.mid"))
+                if found_mid:
+                    chart_file = found_mid[0]
+                    is_midi = True
+
             drum_files = list(folder.glob("drums*.ogg")) + list(folder.glob("drums*.wav"))
 
             if not drum_files or chart_file is None:
@@ -50,7 +72,6 @@ def process_dataset(dataset_path: str, output_pkl: str = "data.pkl"):
                 if y_mixed is None:
                     y_mixed = y_part
                 else:
-                    # Pad to avoid dimensional mismatch if one stem is slightly longer (e.g., cymbal tail)
                     max_len = max(len(y_mixed), len(y_part))
                     if len(y_mixed) < max_len:
                         y_mixed = np.pad(y_mixed, (0, max_len - len(y_mixed)))
@@ -60,14 +81,17 @@ def process_dataset(dataset_path: str, output_pkl: str = "data.pkl"):
             
             y = y_mixed
             
-            # TUNING: Emphasize kick drums (fmin) + cymbals (fmax) to match Master Plan instructions
             mel_spectrogram = librosa.feature.melspectrogram(
                 y=y, sr=sr, n_mels=128, fmin=20, fmax=22050, hop_length=mel_hop_length
             )
-            mel_spectrogram = torch.tensor(mel_spectrogram, dtype=torch.float32) # Shape: [128, total_mel_frames]
+            mel_spectrogram = torch.tensor(mel_spectrogram, dtype=torch.float32)
             
-            # Use Phase 2 Parser
-            events_drums, _ = parser.parse_file(str(chart_file))
+            # Utilize the correct bindings
+            if is_midi:
+                events_drums, _ = parser.parse_midi(str(chart_file))
+            else:
+                events_drums, _ = parser.parse_file(str(chart_file))
+                
             audio_duration_ms = (len(y) / sr) * 1000
             label_matrix = parser.create_matrix(events_drums, max_time_ms=audio_duration_ms)
             
@@ -102,20 +126,21 @@ def process_dataset(dataset_path: str, output_pkl: str = "data.pkl"):
                     seq_mels.append(slice_mel.unsqueeze(0)) # Shape [1, 128, 87]
                     seq_labels.append(torch.tensor(label_matrix[t]))
                     
-                data_store[f"{idx}_{seq_start}"] = {
+                # Serialize the sequence dynamically to Disk avoiding dictionary bloat
+                tensor_payload = {
                     "input": torch.stack(seq_mels), # [seq_len, 1, 128, 87]
                     "label": torch.stack(seq_labels) # [seq_len, 5]
                 }
+                torch.save(tensor_payload, tensors_dir / f"seq_{idx}_{seq_start}.pt")
+                chunk_count += 1
                 
             valid_count += 1
 
         except Exception as e:
             print(f"Skipping {folder.name} due to unexpected parsing error: {e}")
 
-    print(f"Compiled {len(data_store)} total sliding windows from {valid_count} songs.")
-    with open(output_pkl, "wb") as f:
-        pickle.dump(data_store, f)
-    print("Preprocessing complete. Results saved securely to data.pkl.")
+    print(f"Compiled {chunk_count} total sliding windows from {valid_count} songs.")
+    print("Preprocessing complete. Results saved securely into /dataset_tensors/")
 
 if __name__ == "__main__":
     cli = argparse.ArgumentParser()

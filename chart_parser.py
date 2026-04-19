@@ -1,4 +1,5 @@
 import numpy as np
+import mido
 
 class ChartParser:
     def __init__(self, fps=50):
@@ -8,6 +9,64 @@ class ChartParser:
         """
         self.fps = fps
         self.ms_per_frame = 1000.0 / self.fps
+        
+    def parse_midi(self, filepath):
+        """
+        Parses a .mid file (Rock Band natively) extracting strictly PART DRUMS at 
+        the Expert Difficulty (notes 96-100), effectively bypassing Onyx conversion entirely.
+        """
+        mid = mido.MidiFile(filepath)
+        
+        # 1. Build tempo map from Track 0
+        tempo_map = []
+        current_tick = 0
+        for msg in mid.tracks[0]:
+            current_tick += msg.time
+            if msg.type == 'set_tempo':
+                tempo_map.append({"tick": current_tick, "tempo": msg.tempo})
+                
+        # 2. Extract Drum Track
+        drum_track = next((t for t in mid.tracks if t.name in ['PART DRUMS', 'PART DRUM']), None)
+        events_drums = []
+        if drum_track is not None:
+            current_tick = 0
+            for msg in drum_track:
+                current_tick += msg.time
+                if msg.type == 'note_on' and msg.velocity > 0:
+                    # Expert Drum mapped notes: 96 Kick, 97 Red, 98 Yel, 99 Blu, 100 Gr
+                    if 96 <= msg.note <= 100:
+                        lane = msg.note - 96
+                        events_drums.append({"tick": current_tick, "lane": lane})
+                        
+        # 3. Convert all Drum ticks directly to milliseconds via Tempo curve
+        resolution = mid.ticks_per_beat
+        tempo_map = sorted(tempo_map, key=lambda x: x["tick"])
+        
+        if not tempo_map or tempo_map[0]["tick"] != 0:
+            tempo_map.insert(0, {"tick": 0, "tempo": 500000, "start_ms": 0.0})
+        else:
+            tempo_map[0]["start_ms"] = 0.0
+            
+        for i in range(1, len(tempo_map)):
+            prev = tempo_map[i-1]
+            dt = tempo_map[i]["tick"] - prev["tick"]
+            ms_dur = dt * (prev["tempo"] / 1000.0) / float(resolution)
+            tempo_map[i]["start_ms"] = prev["start_ms"] + ms_dur
+            
+        def get_ms_for_tick(target_tick):
+            active_tempo = tempo_map[0]
+            for t in tempo_map:
+                if t["tick"] <= target_tick:
+                    active_tempo = t
+                else: break
+            dt = target_tick - active_tempo["tick"]
+            ms_dur = dt * (active_tempo["tempo"] / 1000.0) / float(resolution)
+            return active_tempo["start_ms"] + ms_dur
+            
+        for event in events_drums:
+            event["ms"] = get_ms_for_tick(event["tick"])
+            
+        return events_drums, tempo_map
         
     def parse_file(self, filepath):
         """
