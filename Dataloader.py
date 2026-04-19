@@ -9,8 +9,6 @@ for example: to get a sample from data.json, we can use `data[index]["input"]` a
 import torch.utils.data
 import pickle
 
-from torch.utils.data.dataset import T_co
-
 
 class Dataset(torch.utils.data.Dataset):
     def __init__(self, path):

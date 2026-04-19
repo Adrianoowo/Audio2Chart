@@ -1,118 +1,124 @@
-"""
-this file is used to:
-
-1. compute mel spectrogram
-2. according to bpm and beat, split spectrogram into many 2 seconds pieces
-3. save the results above and the label into the shape: {index: {"input": [beat_num, 1, 128, 87],"label": [beat_num, 256]}}
-
-for example: to get a sample from data.json, we can use `data[index]["input"]` and `data[index]["label"]`
-"""
 import librosa
 import librosa.feature
 import torch
-import json
-import os
 import pickle
+import numpy as np
+from pathlib import Path
+from chart_parser import ChartParser
+import argparse
 
-
-def note2beatindex(beat):
+def process_dataset(dataset_path: str, output_pkl: str = "data.pkl"):
     """
-    convert beat like into the index of corresponding section
-    :return: (int)
+    Rethought Preprocessing script for Clone Hero Drums.
+    Instead of Malody formats, dynamically utilizes our chart_parser 
+    and slices the `drums.ogg` mel-spectrograms mapping them to the neural matrices.
     """
-    return int(beat[0] * 4 + 4 / beat[2] * beat[1])
+    parser = ChartParser(fps=50) # 20 ms frames
+    mel_hop_length = 512
+    sr = 44100
+    
+    # 87 frames of mel-spectrogram correspond to ~ 1.0 sec of audio
+    # For a given 20ms matrix timestep, we will provide the surrounding ~1 sec context
+    mel_context_frames = 87 
+    half_context = mel_context_frames // 2
+    
+    base_path = Path(dataset_path)
+    if not base_path.exists():
+        print("Dataset path not found.")
+        return
 
+    data_store = {}
+    
+    # Recursively find all folders holding a .chart file across nested subdirectories
+    song_folders = list(set([f.parent for f in base_path.rglob("*.chart")]))
+    print(f"Discovered {len(song_folders)} folders recursively. Compiling training data...")
+    
+    valid_count = 0
+    for idx, folder in enumerate(song_folders):
+        try:
+            chart_file = next(folder.glob("*.chart"), None)
+            drum_files = list(folder.glob("drums*.ogg")) + list(folder.glob("drums*.wav"))
 
-path_data = "./data"
-num_data = len(os.listdir(path_data))
+            if not drum_files or chart_file is None:
+                continue
 
-data = {}
-counter = 0
-for index in range(num_data):
-    # get the names of audio and chart
-    audio = ""
-    chart = ""
-    for file in os.listdir(path_data + "/" + str(index)):
-        if file.endswith(".ogg"):
-            audio = file
-        elif file.endswith(".mc"):
-            chart = file
+            print(f"Extracting Mel-Spectrogram ({idx+1}/{len(song_folders)}): {folder.name}")
+            
+            y_mixed = None
+            for d_file in drum_files:
+                y_part, _ = librosa.load(d_file, sr=sr, mono=True)
+                if y_mixed is None:
+                    y_mixed = y_part
+                else:
+                    # Pad to avoid dimensional mismatch if one stem is slightly longer (e.g., cymbal tail)
+                    max_len = max(len(y_mixed), len(y_part))
+                    if len(y_mixed) < max_len:
+                        y_mixed = np.pad(y_mixed, (0, max_len - len(y_mixed)))
+                    if len(y_part) < max_len:
+                        y_part = np.pad(y_part, (0, max_len - len(y_part)))
+                    y_mixed += y_part
+            
+            y = y_mixed
+            
+            # TUNING: Emphasize kick drums (fmin) + cymbals (fmax) to match Master Plan instructions
+            mel_spectrogram = librosa.feature.melspectrogram(
+                y=y, sr=sr, n_mels=128, fmin=20, fmax=22050, hop_length=mel_hop_length
+            )
+            mel_spectrogram = torch.tensor(mel_spectrogram, dtype=torch.float32) # Shape: [128, total_mel_frames]
+            
+            # Use Phase 2 Parser
+            events_drums, _ = parser.parse_file(str(chart_file))
+            audio_duration_ms = (len(y) / sr) * 1000
+            label_matrix = parser.create_matrix(events_drums, max_time_ms=audio_duration_ms)
+            
+            # Generate the inputs [timestep, 1, 128, 87] tracking the label logic windows
+            # Align Matrix frames with Mel-spectrogram frames
+            num_timesteps = label_matrix.shape[0]
+            
+            # We don't want to kill RAM, so let's compute and chunk the dataset into small sequences.
+            # E.g., sequences of 200 timesteps (~ 4 seconds each).
+            seq_len = 200
+            
+            for seq_start in range(0, num_timesteps - seq_len, seq_len):
+                seq_mels = []
+                seq_labels = []
+                
+                for t in range(seq_start, seq_start + seq_len):
+                    # time in seconds
+                    current_s = (t * parser.ms_per_frame) / 1000.0
+                    center_mel_frame = librosa.time_to_frames(times=current_s, sr=sr, hop_length=mel_hop_length)
+                    
+                    start_f = center_mel_frame - half_context
+                    end_f = center_mel_frame + (mel_context_frames - half_context)
+                    
+                    # Padding zero handlers
+                    if start_f < 0:
+                        slice_mel = torch.cat((torch.zeros([128, -start_f]), mel_spectrogram[:, :end_f]), dim=1)
+                    elif end_f > mel_spectrogram.shape[1]:
+                        slice_mel = torch.cat((mel_spectrogram[:, start_f:], torch.zeros([128, end_f - mel_spectrogram.shape[1]])), dim=1)
+                    else:
+                        slice_mel = mel_spectrogram[:, start_f:end_f]
+                        
+                    seq_mels.append(slice_mel.unsqueeze(0)) # Shape [1, 128, 87]
+                    seq_labels.append(torch.tensor(label_matrix[t]))
+                    
+                data_store[f"{idx}_{seq_start}"] = {
+                    "input": torch.stack(seq_mels), # [seq_len, 1, 128, 87]
+                    "label": torch.stack(seq_labels) # [seq_len, 5]
+                }
+                
+            valid_count += 1
 
-    # read the audio and compute the mel spectrogram
-    try:
-        y, sr = librosa.load(path_data + "/" + str(index) + "/" + audio)
-    except BaseException:
-        print(f"fail, skip index: {index}")
-        continue
-    hop_length = 512
-    mel_spectrogram = librosa.feature.melspectrogram(
-        y=y, sr=sr, hop_length=hop_length)
-    mel_spectrogram = torch.tensor(mel_spectrogram)
+        except Exception as e:
+            print(f"Skipping {folder.name} due to unexpected parsing error: {e}")
 
-    # read the chart file, get bpm and offset
-    chart = open(path_data + "/" + str(index) +
-                 "/" + chart, "r", encoding="utf-8")
-    chart = json.load(chart)
-    bpm = chart["time"][0]["bpm"]
-    offset = chart["note"][-1].get("offset", 0)
+    print(f"Compiled {len(data_store)} total sliding windows from {valid_count} songs.")
+    with open(output_pkl, "wb") as f:
+        pickle.dump(data_store, f)
+    print("Preprocessing complete. Results saved securely to data.pkl.")
 
-    # get rid of the chart that changes bpm
-    if len(chart["time"]) > 1:
-        print(f"bpm changes, skip index:{index}")
-        continue
-
-    # compute the number of possible beats, every beat is divided into 4 sections
-    audio_length = len(y) / sr + offset / 1000
-    beats_num = int(audio_length * bpm / 60)
-    beat_num = beats_num * 4 + 20
-    period = 60 / (bpm * 4)
-
-    # define the temporary data, which will be embedded into data later
-    # convert mel spectrogram into data_temp
-    data_temp = {"input": torch.zeros([beat_num, 1, 128, 87])}
-    for i in range(beat_num):
-        time_now = -offset / 1000 + period * i
-        frame_now = librosa.time_to_frames(
-            times=time_now, sr=sr, hop_length=hop_length)
-        if frame_now - 43 < 0:
-            data_temp["input"][i][0] = torch.cat(
-                (torch.zeros([128, 87 - mel_spectrogram[:, 0: max(frame_now + 43 + 1, 0)].shape[1]]), mel_spectrogram[:, 0: max(frame_now + 43 + 1, 0)]), dim=1)
-        elif frame_now + 43 > mel_spectrogram.shape[1] - 1:
-            data_temp["input"][i][0] = torch.cat(
-                (mel_spectrogram[:, frame_now - 43:],
-                 torch.zeros([128, 87 - mel_spectrogram[:, frame_now - 43:].shape[1]])), dim=1)
-        else:
-            data_temp["input"][i][0] = mel_spectrogram[:,
-                                                       frame_now - 43: frame_now + 43 + 1]
-
-    # convert chart into data_temp
-    # chart_temp is a simulation of chart, the 4 columns represent the 4 Keys in game
-    # 0 for no notes
-    # 1 for note
-    # 2 for long note start
-    # 3 for long note end
-    data_temp["label"] = torch.zeros([beat_num, 4])
-    chart_temp = torch.zeros(beat_num, 4)
-    for note in chart["note"]:
-        if "sound" not in note:
-            if "endbeat" in note:
-                chart_temp[note2beatindex(note["beat"]), note["column"]] = 2
-                chart_temp[note2beatindex(note["endbeat"]), note["column"]] = 3
-            else:
-                chart_temp[note2beatindex(note["beat"]), note["column"]] = 1
-    for i in range(beat_num):
-        # temp_index = chart_temp[i][0] * 1 + chart_temp[i][1] * 4 + chart_temp[i][2] * 16 + chart_temp[i][3] * 64
-        # data_temp["label"][i][int(temp_index)] = 1
-        for j in range(4):
-            data_temp["label"][i][j] = int(chart_temp[i][j])
-
-    # embed data_temp into data
-    data[index] = data_temp
-    counter = counter + 1
-
-
-# save data as data.json
-output = open("data.pkl", "wb")
-pickle.dump(data, output)
-output.close()
-print(f"already save data into data.pkl, there are {counter} data")
+if __name__ == "__main__":
+    cli = argparse.ArgumentParser()
+    cli.add_argument("dataset_path", help="Folder containing validated chart folders.")
+    args = cli.parse_args()
+    process_dataset(args.dataset_path)

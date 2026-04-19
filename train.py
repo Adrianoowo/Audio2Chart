@@ -1,46 +1,64 @@
 from torch.utils.data import random_split, DataLoader
-from model import *
+import torch
+import torch.nn as nn
+from model import ChartNet
 from Dataloader import Dataset
 from tqdm import tqdm
+import argparse
 
-# prepare dataset
-data_set = Dataset("./data.pkl")
-train_len = int(len(data_set) * 0.8)
-train_set, test_set = random_split(
-    data_set, [train_len, len(data_set) - train_len])
-train_loader = DataLoader(train_set, batch_size=1, shuffle=True)
-test_loader = DataLoader(test_set, batch_size=1, shuffle=False)
+def train_model(data_path="data.pkl", epochs=30, batch_size=4, lr=0.001):
+    # Dataloader hasn't explicitly changed structurally regarding keys: input/label
+    print(f"Loading Dataset from {data_path}...")
+    data_set = Dataset(data_path)
+    train_len = int(len(data_set) * 0.8)
+    train_set, test_set = random_split(data_set, [train_len, len(data_set) - train_len])
+    
+    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
+    test_loader = DataLoader(test_set, batch_size=1, shuffle=False)
 
-# compute proper weight in CrossEntropyLoss
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Booting training on: {device}")
 
-weight = torch.tensor([20, 100, 5, 5], device=device).to(torch.float)
+    # Standard architecture mapped in Phase 3
+    model = ChartNet(fc_feature=600, audio_feature=500, hidden_dim=512, num_layers=2, output_dim=5).to(device)
 
-# define training options
-model = ChartNet(600, 500, 512, 2, 16).to(device)
-model.load_state_dict(torch.load('checkpoints/e_8.pth', map_location=device))
+    # Multi-label classification requires BCEWithLogitsLoss logic
+    # Adding a positive weight to heavily combat the sparse 'zeros' in drums
+    pos_weight = torch.tensor([50.0, 50.0, 50.0, 50.0, 50.0], device=device) 
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    
+    optim = torch.optim.Adam(model.parameters(), lr=lr)
 
-loss = nn.CrossEntropyLoss(weight=weight)
-# optim = torch.optim.Adam(model.parameters(), lr=0.05)
-optim = torch.optim.SGD(model.parameters(), lr=0.1)
-model.to(device)
-model.train()
+    print("Beginning Training Loop...")
+    for epoch in range(epochs):
+        model.train()
+        running_loss = 0.0
+        
+        for index, sample in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}")):
+            inputs = sample["input"].to(device) # Shape: [batch, seq_len, 1, 128, 87]
+            labels = sample["label"].to(device) # Shape: [batch, seq_len, 5]
+            
+            optim.zero_grad()
+            outputs = model(inputs) # Shape: [batch, seq_len, 5]
+            
+            # Loss expects [N, *] flattening
+            loss = criterion(outputs.view(-1, 5), labels.view(-1, 5))
+            loss.backward()
+            optim.step()
+            
+            running_loss += loss.item()
+            
+        print(f"--- Epoch {epoch+1} Complete | Avg Loss: {running_loss/(index+1):.4f}")
+        
+        # Save checkpoints aggressively
+        torch.save(model.state_dict(), f"checkpoints/drum_model_epoch_{epoch+1}.pth")
 
-# start training
-for epoch in range(30):
-    running_loss = torch.tensor([0], device=device)
-    for index, sample in enumerate(tqdm(train_loader)):
-        inputs = sample["input"].to(device)
-        labels = sample["label"].squeeze(dim=0).to(device)
-        optim.zero_grad()
-        outputs = model(inputs)
-        outputs = torch.reshape(outputs, [-1, 4, 4])
-        temp_loss = loss(outputs, labels.to(torch.long))
-        temp_loss.backward()
-        running_loss = running_loss + temp_loss
-        optim.step()
-    print(f"epoch: {epoch}, avarage loss: {running_loss/index}")
+    print("Training finished perfectly!")
 
-# save model
-torch.save(model.state_dict(), "checkpoints/e_9.pth")
-print(f"finished")
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data", default="data.pkl", help="Preprocessed data mapping.")
+    parser.add_argument("--epochs", type=int, default=30)
+    args = parser.parse_args()
+    
+    train_model(data_path=args.data, epochs=args.epochs)
